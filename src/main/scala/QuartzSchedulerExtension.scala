@@ -241,7 +241,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     scheduleInternal(name, receiver, msg, None)
   }
 
-  private def removeSchedule(name: String) = schedules.remove(name.toUpperCase)
+  def removeSchedule(name: String) = schedules.remove(name.toUpperCase)
 
   /**
     * Schedule a job, whose named configuration must be available
