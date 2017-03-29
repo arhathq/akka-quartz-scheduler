@@ -1,6 +1,7 @@
 package com.typesafe.akka.extension.quartz
 
 import java.text.ParseException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.{Date, TimeZone}
 
 import akka.actor._
@@ -11,7 +12,6 @@ import org.quartz.core.jmx.JobDataMapSupport
 import org.quartz.impl.DirectSchedulerFactory
 import org.quartz.simpl.{RAMJobStore, SimpleThreadPool}
 
-import scala.collection.{immutable, mutable}
 import scala.util.control.Exception._
 
 
@@ -63,10 +63,11 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
    *
    * RECAST KEY AS UPPERCASE TO AVOID RUNTIME LOOKUP ISSUES
    */
-  var schedules: immutable.Map[String, QuartzSchedule] = QuartzSchedules(config, defaultTimezone).map { kv =>
-    kv._1.toUpperCase -> kv._2
+  val schedules: ConcurrentHashMap[String, QuartzSchedule] = new ConcurrentHashMap[String, QuartzSchedule]
+  QuartzSchedules(config, defaultTimezone).foreach { kv =>
+    schedules.put(kv._1.toUpperCase, kv._2)
   }
-  val runningJobs: mutable.Map[String, JobKey] = mutable.Map.empty[String, JobKey]
+  val runningJobs: ConcurrentHashMap[String, JobKey] = new ConcurrentHashMap[String, JobKey]
 
   log.debug("Configured Schedules: {}", schedules)
 
@@ -106,7 +107,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
   def nextTrigger(name: String): Option[Date] = {
     import scala.collection.JavaConverters._
     for {
-      jobKey <- runningJobs.get(name)
+      jobKey <- runningJobs.asScala.get(name)
       trigger <- scheduler.getTriggersOfJob(jobKey).asScala.headOption
     } yield trigger.getNextFireTime
   }
@@ -135,7 +136,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     * @return Success or Failure in a Boolean
     */
   def suspendJob(name: String): Boolean = {
-    runningJobs.get(name) match {
+    Option(runningJobs.get(name)) match {
       case Some(job) =>
         log.info("Suspending Quartz Job '{}'", name)
         scheduler.pauseJob(job)
@@ -154,7 +155,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     * @return Success or Failure in a Boolean
     */
   def resumeJob(name: String): Boolean = {
-    runningJobs.get(name) match {
+    Option(runningJobs.get(name)) match {
       case Some(job) =>
         log.info("Resuming Quartz Job '{}'", name)
         scheduler.resumeJob(job)
@@ -181,11 +182,11 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     * @return Success or Failure in a Boolean
     */
   def cancelJob(name: String): Boolean = {
-    runningJobs.get(name) match {
+    Option(runningJobs.get(name)) match {
       case Some(job) =>
         log.info("Cancelling Quartz Job '{}'", name)
         val result = scheduler.deleteJob(job)
-        runningJobs -= name
+        runningJobs.remove(name)
         result
       case None =>
         log.warning("No running Job named '{}' found: Cannot cancel", name)
@@ -204,17 +205,20 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
    *
    */
   def createSchedule(name: String, description: Option[String] = None, cronExpression: String, calendar: Option[String] = None,
-                     timezone: TimeZone = defaultTimezone) = schedules.get(name.toUpperCase) match {
-    case Some(sched) =>
-      throw new IllegalArgumentException(s"A schedule with this name already exists: [$name]")
-    case None =>
-      val expression = catching(classOf[ParseException]) either new CronExpression(cronExpression) match {
-        case Left(t) =>
-          throw new IllegalArgumentException(s"Invalid 'expression' for Cron Schedule '$name'. Failed to validate CronExpression.", t)
-        case Right(expr) => expr
+                     timezone: TimeZone = defaultTimezone) = {
+    schedules.compute(name.toUpperCase, (key: String, value: QuartzSchedule) => {
+      Option(value) match {
+        case Some(sched) =>
+          throw new IllegalArgumentException(s"A schedule with this name already exists: [$key]")
+        case None =>
+          val expression = catching(classOf[ParseException]) either new CronExpression(cronExpression) match {
+            case Left(t) =>
+              throw new IllegalArgumentException(s"Invalid 'expression' for Cron Schedule '$key'. Failed to validate CronExpression.", t)
+            case Right(expr) => expr
+          }
+          new QuartzCronSchedule(key, description, expression, timezone, calendar)
       }
-      val quartzSchedule = new QuartzCronSchedule(name, description, expression, timezone, calendar)
-      schedules += (name.toUpperCase -> quartzSchedule)
+    })
   }
 
   /**
@@ -237,7 +241,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     scheduleInternal(name, receiver, msg, None)
   }
 
-  private def removeSchedule(name: String) = schedules = schedules - name.toUpperCase
+  private def removeSchedule(name: String) = schedules.remove(name.toUpperCase)
 
   /**
     * Schedule a job, whose named configuration must be available
@@ -310,7 +314,7 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
     * @param startDate The optional date indicating the earliest time the job may fire.
     * @return A date which indicates the first time the trigger will fire.
     */
-  private def scheduleInternal(name: String, receiver: AnyRef, msg: AnyRef, startDate: Option[Date]): Date = schedules.get(name.toUpperCase) match {
+  private def scheduleInternal(name: String, receiver: AnyRef, msg: AnyRef, startDate: Option[Date]): Date = Option(schedules.get(name.toUpperCase)) match {
     case Some(schedule) => scheduleJob(name, receiver, msg, startDate)(schedule)
     case None => throw new IllegalArgumentException("No matching quartz configuration found for schedule '%s'".format(name))
   }
@@ -337,17 +341,17 @@ class QuartzSchedulerExtension(system: ExtendedActorSystem) extends Extension {
       .withDescription(schedule.description.orNull)
       .build()
 
-    log.debug("Adding jobKey {} to runningJobs map.", job.getKey)
-
-    runningJobs += name -> job.getKey
-
     log.debug("Building Trigger with startDate '{}", startDate.getOrElse(new Date()))
     val trigger = schedule.buildTrigger(name, startDate)
 
     log.debug("Scheduling Job '{}' and Trigger '{}'. Is Scheduler Running? {}", job, trigger, scheduler.isStarted)
-    scheduler.scheduleJob(job, trigger)
-  }
+    val firstFireTime = scheduler.scheduleJob(job, trigger)
 
+    log.debug("Adding jobKey {} to runningJobs map.", job.getKey)
+    runningJobs.putIfAbsent(name, job.getKey)
+
+    firstFireTime
+  }
 
   /**
    * Parses calendar configurations, creates Calendar instances and attaches them to the scheduler
